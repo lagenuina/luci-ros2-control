@@ -200,8 +200,6 @@ class LuciPIDVelocityController(Node):
         self.actual_angular = msg.twist.twist.angular.z
         self.odom_received  = True
 
-        print(msg.twist.twist.linear.y)
-
     def control_loop(self):
         if not self.odom_received:
             self.get_logger().warn(
