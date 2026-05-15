@@ -7,6 +7,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from tf2_ros import Buffer, TransformListener
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
@@ -60,7 +61,7 @@ class LuciPositionPID(Node):
         self.declare_parameter('goal_tolerance',          0.05)
         self.declare_parameter('orientation_tolerance',   0.05)
         self.declare_parameter('heading_deadband',        0.26)
-        self.declare_parameter('pose_topic',              'rtabmap/odom')
+        self.declare_parameter('pose_topic',              'rachel')
         self.declare_parameter('pos_kp',                  1.2)
         self.declare_parameter('pos_ki',                  0.5)
         self.declare_parameter('pos_kd',                  0.2)
@@ -102,18 +103,16 @@ class LuciPositionPID(Node):
         self.orientation_reached = False
         self._active_goal_handle = None
 
+        self.world_frame = 'motive_world'
+        self.robot_frame = p('pose_topic')  # default: rachel
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.cmd_pub  = self.create_publisher(Twist,       'cmd_vel',      10)
         self.goal_pub = self.create_publisher(PoseStamped, 'current_goal', 10)
 
         cb_group = ReentrantCallbackGroup()
-
-        self.create_subscription(
-            Odometry,
-            p('pose_topic'),
-            self.pose_cb,
-            5,
-            callback_group=cb_group
-        )
 
         self._action_server = ActionServer(
             self,
@@ -131,6 +130,12 @@ class LuciPositionPID(Node):
             callback_group=cb_group
         )
 
+        self.create_timer(
+            0.01,
+            self.update_pose,
+            callback_group=cb_group
+        )
+
         self.get_logger().info(
             f'LuciPositionPID ready\n'
             f'  Pose source : /{p("pose_topic")} (map frame, from RTAB-Map)\n'
@@ -140,13 +145,32 @@ class LuciPositionPID(Node):
             f'(send goals in map frame)'
         )
 
-    def pose_cb(self, msg):
-        """Read robot pose directly from RTAB-Map — no integration needed."""
-        self.actual_x   = msg.pose.pose.position.x
-        self.actual_y   = msg.pose.pose.position.y
-        self.actual_yaw = quat_to_yaw(msg.pose.pose.orientation)
-        self.pose_received = True
 
+    def update_pose(self):
+        """
+        Lookup tf transform from 'motive_world' to 'rachel'
+        and use it as the robot's current pose.
+        """
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.world_frame,
+                self.robot_frame,
+                rclpy.time.Time()
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'Waiting for TF {self.world_frame} -> {self.robot_frame}: {e}',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        self.actual_x = tf.transform.translation.x
+        self.actual_y = tf.transform.translation.y
+        self.actual_yaw = quat_to_yaw(tf.transform.rotation)
+
+        self.pose_received = True
+ 
     def _goal_callback(self, goal_request):
         self.get_logger().info('Received new navigation goal — accepting.')
         if self._active_goal_handle is not None:
