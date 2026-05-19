@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 import math
 
 import rclpy
@@ -7,9 +8,12 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
+
+from tf2_ros import Buffer, TransformListener, LookupException, \
+    ConnectivityException, ExtrapolationException
 
 def quat_to_yaw(q) -> float:
     """Extract yaw from a quaternion."""
@@ -57,10 +61,13 @@ class LuciPositionPID(Node):
     def __init__(self):
         super().__init__('luci_position_pid')
 
-        self.declare_parameter('goal_tolerance',          0.05)
-        self.declare_parameter('orientation_tolerance',   0.05)
+        self.declare_parameter('goal_tolerance',          0.15)
+        self.declare_parameter('orientation_tolerance',   0.15)
         self.declare_parameter('heading_deadband',        0.26)
-        self.declare_parameter('pose_topic',              'rtabmap/odom')
+        self.declare_parameter('goal_stable_ticks',       3)
+        self.declare_parameter('map_frame',               'map')
+        self.declare_parameter('robot_frame',             'camera_01_link')
+        self.declare_parameter('odom_topic',              'luci/odom')
         self.declare_parameter('pos_kp',                  1.2)
         self.declare_parameter('pos_ki',                  0.5)
         self.declare_parameter('pos_kd',                  0.2)
@@ -77,8 +84,14 @@ class LuciPositionPID(Node):
         self.goal_tolerance        = p('goal_tolerance')
         self.orientation_tolerance = p('orientation_tolerance')
         self.heading_deadband      = p('heading_deadband')
+        self.goal_stable_required  = int(p('goal_stable_ticks'))
         self.max_linear            = p('max_linear')
         self.max_angular           = p('max_angular')
+        self.map_frame             = p('map_frame')
+        self.robot_frame           = p('robot_frame')
+
+        self.tf_buffer   = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.pid_position = PID(
             kp=p('pos_kp'), ki=p('pos_ki'), kd=p('pos_kd'),
@@ -93,13 +106,23 @@ class LuciPositionPID(Node):
         self.actual_y       = 0.0
         self.actual_yaw     = 0.0
         self.last_time      = self.get_clock().now()
-        self.pose_received  = False
+
+        # Latest wheel-odom velocities (LUCI body frame: forward = linear.y).
+        self.odom_lin       = 0.0
+        self.odom_ang       = 0.0
+        self.odom_received  = False
+
+        # Dead-reckoning active flag — set on goal acceptance, cleared on
+        # goal completion/cancel. When True, control_loop integrates
+        # actual_x/y/yaw from odom velocities instead of polling TF.
+        self.dr_active      = False
 
         self.goal_x              = 0.0
         self.goal_y              = 0.0
         self.goal_yaw            = 0.0
         self.goal_reached        = False
         self.orientation_reached = False
+        self.goal_stable_count   = 0
         self._active_goal_handle = None
 
         self.cmd_pub  = self.create_publisher(Twist,       'cmd_vel',      10)
@@ -109,10 +132,10 @@ class LuciPositionPID(Node):
 
         self.create_subscription(
             Odometry,
-            p('pose_topic'),
-            self.pose_cb,
-            5,
-            callback_group=cb_group
+            p('odom_topic'),
+            self._odom_cb,
+            10,
+            callback_group=cb_group,
         )
 
         self._action_server = ActionServer(
@@ -133,19 +156,45 @@ class LuciPositionPID(Node):
 
         self.get_logger().info(
             f'LuciPositionPID ready\n'
-            f'  Pose source : /{p("pose_topic")} (map frame, from RTAB-Map)\n'
+            f'  Pose source : TF {self.map_frame} -> {self.robot_frame} '
+            f'(snapshot at goal accept), then dead-reckoned from '
+            f'/{p("odom_topic")}\n'
             f'  Goal topic  : /current_goal  '
             f'(add a Pose display in RViz to see the arrow)\n'
             f'  Action      : /navigate_to_pose  '
-            f'(send goals in map frame)'
+            f'(send goals in {self.map_frame} frame)'
         )
 
-    def pose_cb(self, msg):
-        """Read robot pose directly from RTAB-Map — no integration needed."""
-        self.actual_x   = msg.pose.pose.position.x
-        self.actual_y   = msg.pose.pose.position.y
-        self.actual_yaw = quat_to_yaw(msg.pose.pose.orientation)
-        self.pose_received = True
+    def _odom_cb(self, msg: Odometry):
+        # LUCI publishes forward velocity on linear.y (body-frame convention,
+        # matches pid_velocity.py).
+        self.odom_lin = msg.twist.twist.linear.y
+        self.odom_ang = msg.twist.twist.angular.z
+        self.odom_received = True
+
+    def _update_pose_from_tf(self) -> bool:
+        """Refresh actual_x/y/yaw from current map -> robot_frame TF.
+
+        Returns True on success, False if TF is unavailable (e.g. RTAB-Map
+        hasn't relocalized yet). Re-querying each tick means the latest
+        relocalization correction is always reflected in the robot pose.
+        """
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.robot_frame, rclpy.time.Time()
+            )
+        except (LookupException, ConnectivityException,
+                ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'TF {self.map_frame}<-{self.robot_frame} unavailable: {e}',
+                throttle_duration_sec=2.0
+            )
+            return False
+
+        self.actual_x   = t.transform.translation.x
+        self.actual_y   = t.transform.translation.y
+        self.actual_yaw = quat_to_yaw(t.transform.rotation)
+        return True
 
     def _goal_callback(self, goal_request):
         self.get_logger().info('Received new navigation goal — accepting.')
@@ -159,16 +208,38 @@ class LuciPositionPID(Node):
 
     async def _execute_callback(self, goal_handle):
         """
-        Goal is already in map frame — set it directly, no TF needed.
-        Publish it to /current_goal for RViz visualization.
+        Snapshot current map-frame pose from TF, then dead-reckon to the goal
+        using /luci/odom velocities. This isolates the PID from RTAB-Map
+        relocalization jumps that happen mid-navigation.
         """
         pose = goal_handle.request.pose.pose
 
         goal_stamped = PoseStamped()
-        goal_stamped.header.frame_id = 'map'
+        goal_stamped.header.frame_id = self.map_frame
         goal_stamped.header.stamp    = self.get_clock().now().to_msg()
         goal_stamped.pose            = pose
         self.goal_pub.publish(goal_stamped)
+
+        # Snapshot the starting pose from TF (with a brief retry — TF buffer
+        # might be momentarily empty at startup).
+        snapshot_ok = False
+        for _ in range(10):
+            if self._update_pose_from_tf():
+                snapshot_ok = True
+                break
+            await asyncio.sleep(0.1)
+        if not snapshot_ok:
+            self.get_logger().error(
+                'Cannot snapshot starting pose — TF unavailable. Aborting goal.'
+            )
+            goal_handle.abort()
+            return NavigateToPose.Result()
+
+        self.get_logger().info(
+            f'Snapshot pose (map): x={self.actual_x:.2f} y={self.actual_y:.2f} '
+            f'yaw={math.degrees(self.actual_yaw):.1f}°  — dead-reckoning enabled'
+        )
+        self.dr_active = True
 
         self._set_goal(
             x=pose.position.x,
@@ -185,6 +256,7 @@ class LuciPositionPID(Node):
             if goal_handle.is_cancel_requested:
                 self.get_logger().info('Goal cancelled.')
                 self._stop_robot()
+                self.dr_active = False
                 goal_handle.canceled()
                 self._active_goal_handle = None
                 return NavigateToPose.Result()
@@ -192,16 +264,17 @@ class LuciPositionPID(Node):
 
             if self._active_goal_handle is not goal_handle:
                 self.get_logger().info('Goal preempted.')
+                self.dr_active = False
                 goal_handle.abort()
                 return NavigateToPose.Result()
 
 
             if self.orientation_reached:
                 self.get_logger().info('Goal succeeded.')
+                self.dr_active = False
                 goal_handle.succeed()
                 self._active_goal_handle = None
                 return NavigateToPose.Result()
-
 
             dx = self.goal_x - self.actual_x
             dy = self.goal_y - self.actual_y
@@ -210,25 +283,27 @@ class LuciPositionPID(Node):
 
             rate.sleep()
 
+        self.dr_active = False
         goal_handle.abort()
         self._active_goal_handle = None
         return NavigateToPose.Result()
 
     def control_loop(self):
-        if not self.pose_received:
-            self.get_logger().warn(
-                'Waiting for RTAB-Map pose on '
-                f'/{self.get_parameter("pose_topic").value} ...',
-                throttle_duration_sec=2.0
-            )
+        if self._active_goal_handle is None or self.orientation_reached:
             return
 
-        if self._active_goal_handle is None or self.orientation_reached:
+        if not (self.dr_active and self.odom_received):
             return
 
         now = self.get_clock().now()
         dt  = (now - self.last_time).nanoseconds * 1e-9
         self.last_time = now
+
+        # Dead-reckon from the snapshotted starting pose. Forward Euler is
+        # fine at 20 Hz for wheelchair speeds.
+        self.actual_x   += self.odom_lin * math.cos(self.actual_yaw) * dt
+        self.actual_y   += self.odom_lin * math.sin(self.actual_yaw) * dt
+        self.actual_yaw  = angle_wrap(self.actual_yaw + self.odom_ang * dt)
 
         if not self.goal_reached:
             dx            = self.goal_x - self.actual_x
@@ -237,7 +312,15 @@ class LuciPositionPID(Node):
             angle_to_goal = math.atan2(dy, dx)
             heading_error = angle_wrap(angle_to_goal - self.actual_yaw)
 
+            # Hysteresis: need N consecutive ticks inside tolerance before
+            # declaring success. Stops a single loop-closure jump from either
+            # latching success prematurely or unlatching it.
             if distance < self.goal_tolerance:
+                self.goal_stable_count += 1
+            else:
+                self.goal_stable_count = 0
+
+            if self.goal_stable_count >= self.goal_stable_required:
                 self.get_logger().info(
                     f'Position reached!  '
                     f'x={self.actual_x:.2f}  y={self.actual_y:.2f}'
@@ -248,12 +331,15 @@ class LuciPositionPID(Node):
                 self._stop_robot()
                 return
 
-            # Rotate in place when not facing the goal, unless we're already
-            # close enough that angle_to_goal becomes noisy.
-            far_from_goal   = distance > 2.0 * self.goal_tolerance
-            facing_goal     = abs(heading_error) <= self.heading_deadband
+            # Heading-silent zone: within 2x tolerance, atan2(dy,dx) is
+            # noise-dominated. Creep forward without chasing it; let the
+            # position PID close the gap and hysteresis call success.
+            in_silent_zone = distance < 2.0 * self.goal_tolerance
 
-            if far_from_goal and not facing_goal:
+            if in_silent_zone:
+                desired_linear  = self.pid_position.compute(distance, 0.0, dt)
+                desired_angular = 0.0
+            elif abs(heading_error) > self.heading_deadband:
                 self.pid_position.reset()
                 desired_linear  = 0.0
                 desired_angular = self.pid_heading.compute(
@@ -311,6 +397,7 @@ class LuciPositionPID(Node):
         self.goal_yaw            = yaw
         self.goal_reached        = False
         self.orientation_reached = False
+        self.goal_stable_count   = 0
         self.pid_position.reset()
         self.pid_heading.reset()
         self.last_time = self.get_clock().now()
