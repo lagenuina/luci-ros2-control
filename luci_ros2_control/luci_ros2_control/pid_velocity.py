@@ -123,9 +123,6 @@ class LuciPIDVelocityController(Node):
     def __init__(self):
         super().__init__('luci_pid_velocity_controller')
 
-        # self.declare_parameter('desired_linear',  2)
-        # self.declare_parameter('desired_angular', 0.0)
-
         self.declare_parameter('linear_kp',  1.2)
         self.declare_parameter('linear_ki',  0.5)
         self.declare_parameter('linear_kd',  0.2)
@@ -211,8 +208,6 @@ class LuciPIDVelocityController(Node):
         dt  = (now - self.last_time).nanoseconds * 1e-9
         self.last_time = now
 
-        # No commanded motion: stay silent so LUCI engages the brake once
-        # instead of toggling it every loop iteration.
         if self.desired_linear == 0.0 and self.desired_angular == 0.0:
             self.pid_linear.reset()
             self.pid_angular.reset()
@@ -237,16 +232,6 @@ class LuciPIDVelocityController(Node):
         js.joystick_zone = compute_zone(fb, lr)
         js.input_source  = InputSource.REMOTE
         self.pub.publish(js)
-
-        self.get_logger().info(
-            f'lin: set={self.desired_linear:.2f}  '
-            f'act={self.actual_linear:.2f}  '
-            f'cmd={linear_cmd:.2f}  js={fb}  |  '
-            f'ang: set={self.desired_angular:.2f}  '
-            f'act={self.actual_angular:.2f}  '
-            f'cmd={angular_cmd:.2f}  js={lr}',
-            throttle_duration_sec=0.5
-        )
 
     def set_desired(self, linear: float, angular: float):
         """Update target velocity. Resets integral to avoid windup carry-over."""

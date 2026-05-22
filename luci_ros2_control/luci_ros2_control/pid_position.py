@@ -61,12 +61,12 @@ class LuciPositionPID(Node):
     def __init__(self):
         super().__init__('luci_position_pid')
 
-        self.declare_parameter('goal_tolerance',          0.15)
+        self.declare_parameter('goal_tolerance',          0.10)
         self.declare_parameter('orientation_tolerance',   0.15)
         self.declare_parameter('heading_deadband',        0.26)
         self.declare_parameter('goal_stable_ticks',       3)
         self.declare_parameter('map_frame',               'map')
-        self.declare_parameter('robot_frame',             'camera_01_link')
+        self.declare_parameter('robot_frame',             'base_link')
         self.declare_parameter('odom_topic',              'luci/odom')
         self.declare_parameter('pos_kp',                  1.2)
         self.declare_parameter('pos_ki',                  0.5)
@@ -120,6 +120,7 @@ class LuciPositionPID(Node):
         self.goal_x              = 0.0
         self.goal_y              = 0.0
         self.goal_yaw            = 0.0
+        self.skip_orientation    = False
         self.goal_reached        = False
         self.orientation_reached = False
         self.goal_stable_count   = 0
@@ -154,16 +155,16 @@ class LuciPositionPID(Node):
             callback_group=cb_group
         )
 
-        self.get_logger().info(
-            f'LuciPositionPID ready\n'
-            f'  Pose source : TF {self.map_frame} -> {self.robot_frame} '
-            f'(snapshot at goal accept), then dead-reckoned from '
-            f'/{p("odom_topic")}\n'
-            f'  Goal topic  : /current_goal  '
-            f'(add a Pose display in RViz to see the arrow)\n'
-            f'  Action      : /navigate_to_pose  '
-            f'(send goals in {self.map_frame} frame)'
-        )
+        # self.get_logger().info(
+        #     f'LuciPositionPID ready\n'
+        #     f'  Pose source : TF {self.map_frame} -> {self.robot_frame} '
+        #     f'(snapshot at goal accept), then dead-reckoned from '
+        #     f'/{p("odom_topic")}\n'
+        #     f'  Goal topic  : /current_goal  '
+        #     f'(add a Pose display in RViz to see the arrow)\n'
+        #     f'  Action      : /navigate_to_pose  '
+        #     f'(send goals in {self.map_frame} frame)'
+        # )
 
     def _odom_cb(self, msg: Odometry):
         # LUCI publishes forward velocity on linear.y (body-frame convention,
@@ -241,10 +242,20 @@ class LuciPositionPID(Node):
         )
         self.dr_active = True
 
+        q = pose.orientation
+        skip_orientation = (q.x == 0.0 and q.y == 0.0
+                            and q.z == 0.0 and q.w == 0.0)
+        if skip_orientation:
+            self.get_logger().info(
+                'Goal orientation is unset (zero quaternion) — '
+                'will succeed on position only.'
+            )
+
         self._set_goal(
             x=pose.position.x,
             y=pose.position.y,
-            yaw=quat_to_yaw(pose.orientation),
+            yaw=0.0 if skip_orientation else quat_to_yaw(q),
+            skip_orientation=skip_orientation,
         )
         self._active_goal_handle = goal_handle
 
@@ -326,6 +337,8 @@ class LuciPositionPID(Node):
                     f'x={self.actual_x:.2f}  y={self.actual_y:.2f}'
                 )
                 self.goal_reached = True
+                if self.skip_orientation:
+                    self.orientation_reached = True
                 self.pid_position.reset()
                 self.pid_heading.reset()
                 self._stop_robot()
@@ -361,13 +374,13 @@ class LuciPositionPID(Node):
             msg.angular.z = desired_angular
             self.cmd_pub.publish(msg)
 
-            self.get_logger().info(
-                f'[Phase 1] dist={distance:.2f} m  '
-                f'hdg_err={math.degrees(heading_error):.1f}°  '
-                f'lin={desired_linear:.2f} m/s  '
-                f'ang={desired_angular:.2f} rad/s',
-                throttle_duration_sec=0.5
-            )
+            # self.get_logger().info(
+            #     f'[Phase 1] dist={distance:.2f} m  '
+            #     f'hdg_err={math.degrees(heading_error):.1f}°  '
+            #     f'lin={desired_linear:.2f} m/s  '
+            #     f'ang={desired_angular:.2f} rad/s',
+            #     throttle_duration_sec=0.5
+            # )
             return
 
         yaw_error = angle_wrap(self.goal_yaw - self.actual_yaw)
@@ -391,19 +404,22 @@ class LuciPositionPID(Node):
             throttle_duration_sec=0.5
         )
 
-    def _set_goal(self, x: float, y: float, yaw: float):
+    def _set_goal(self, x: float, y: float, yaw: float,
+                  skip_orientation: bool = False):
         self.goal_x              = x
         self.goal_y              = y
         self.goal_yaw            = yaw
+        self.skip_orientation    = skip_orientation
         self.goal_reached        = False
         self.orientation_reached = False
         self.goal_stable_count   = 0
         self.pid_position.reset()
         self.pid_heading.reset()
         self.last_time = self.get_clock().now()
+        yaw_str = 'unset' if skip_orientation else f'{math.degrees(yaw):.1f}°'
         self.get_logger().info(
             f'New goal (map frame) → '
-            f'x={x:.2f} m  y={y:.2f} m  yaw={math.degrees(yaw):.1f}°'
+            f'x={x:.2f} m  y={y:.2f} m  yaw={yaw_str}'
         )
 
     def _stop_robot(self):
