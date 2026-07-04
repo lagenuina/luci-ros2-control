@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone MPPI test: subscribe to /goal_pose and drive there directly.
-No global path, no risk map — pure MPPI with terminal-distance and
-heading-alignment costs only.
+MPPI implementation
 """
 
 import math
