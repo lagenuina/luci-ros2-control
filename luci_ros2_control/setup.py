@@ -27,6 +27,9 @@ setup(
         'console_scripts': [
             'pid_velocity = luci_ros2_control.pid_velocity:main',
             'pid_position = luci_ros2_control.pid_position:main',
+            'local_planner = luci_ros2_control.local_planner:main',
+            'global_planner = luci_ros2_control.global_planner:main',
+            'twist_to_luci_joystick = luci_ros2_control.twist_to_luci_joystick:main',
         ],
     },
 )

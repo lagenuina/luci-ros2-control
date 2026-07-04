@@ -6,15 +6,15 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='luci_ros2_control',
-            executable='pid_velocity',
-            name='luci_pid_velocity_controller',
+            executable='local_planner',
+            name='local_planner',
             output='screen',
             emulate_tty=True,
         ),
         Node(
             package='luci_ros2_control',
-            executable='pid_position',
-            name='luci_position_pid',
+            executable='twist_to_luci_joystick',
+            name='twist_to_luci_joystick',
             output='screen',
             emulate_tty=True,
         ),

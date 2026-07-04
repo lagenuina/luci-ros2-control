@@ -10,7 +10,6 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Odometry
 
 from tf2_ros import Buffer, TransformListener, LookupException, \
     ConnectivityException, ExtrapolationException
@@ -34,8 +33,8 @@ class PID:
         self.kd           = kd
         self.output_limit = output_limit
         self.windup_limit = windup_limit
-        self._integral     = 0.0
-        self._prev_measure = None
+        self._integral   = 0.0
+        self._prev_error = None
 
     def compute(self, setpoint: float, measurement: float, dt: float) -> float:
         if dt <= 0.0:
@@ -46,15 +45,17 @@ class PID:
         self._integral  = max(-self.windup_limit,
                               min(self.windup_limit, self._integral))
         i = self.ki * self._integral
-        d = 0.0 if self._prev_measure is None else \
-            -self.kd * (measurement - self._prev_measure) / dt
-        self._prev_measure = measurement
+        
+        d = 0.0 if self._prev_error is None else \
+            self.kd * (error - self._prev_error) / dt
+            
+        self._prev_error = error
         output = p + i + d
         return max(-self.output_limit, min(self.output_limit, output))
 
     def reset(self):
-        self._integral     = 0.0
-        self._prev_measure = None
+        self._integral   = 0.0
+        self._prev_error = None
 
 class LuciPositionPID(Node):
 
@@ -62,12 +63,11 @@ class LuciPositionPID(Node):
         super().__init__('luci_position_pid')
 
         self.declare_parameter('goal_tolerance',          0.10)
-        self.declare_parameter('orientation_tolerance',   0.15)
-        self.declare_parameter('heading_deadband',        0.26)
+        self.declare_parameter('orientation_tolerance',   0.10)
+        self.declare_parameter('heading_deadband',        0.10)
         self.declare_parameter('goal_stable_ticks',       3)
         self.declare_parameter('map_frame',               'map')
         self.declare_parameter('robot_frame',             'base_link')
-        self.declare_parameter('odom_topic',              'luci/odom')
         self.declare_parameter('pos_kp',                  1.2)
         self.declare_parameter('pos_ki',                  0.5)
         self.declare_parameter('pos_kd',                  0.2)
@@ -107,16 +107,6 @@ class LuciPositionPID(Node):
         self.actual_yaw     = 0.0
         self.last_time      = self.get_clock().now()
 
-        # Latest wheel-odom velocities (LUCI body frame: forward = linear.y).
-        self.odom_lin       = 0.0
-        self.odom_ang       = 0.0
-        self.odom_received  = False
-
-        # Dead-reckoning active flag — set on goal acceptance, cleared on
-        # goal completion/cancel. When True, control_loop integrates
-        # actual_x/y/yaw from odom velocities instead of polling TF.
-        self.dr_active      = False
-
         self.goal_x              = 0.0
         self.goal_y              = 0.0
         self.goal_yaw            = 0.0
@@ -130,14 +120,6 @@ class LuciPositionPID(Node):
         self.goal_pub = self.create_publisher(PoseStamped, 'current_goal', 10)
 
         cb_group = ReentrantCallbackGroup()
-
-        self.create_subscription(
-            Odometry,
-            p('odom_topic'),
-            self._odom_cb,
-            10,
-            callback_group=cb_group,
-        )
 
         self._action_server = ActionServer(
             self,
@@ -154,24 +136,6 @@ class LuciPositionPID(Node):
             self.control_loop,
             callback_group=cb_group
         )
-
-        # self.get_logger().info(
-        #     f'LuciPositionPID ready\n'
-        #     f'  Pose source : TF {self.map_frame} -> {self.robot_frame} '
-        #     f'(snapshot at goal accept), then dead-reckoned from '
-        #     f'/{p("odom_topic")}\n'
-        #     f'  Goal topic  : /current_goal  '
-        #     f'(add a Pose display in RViz to see the arrow)\n'
-        #     f'  Action      : /navigate_to_pose  '
-        #     f'(send goals in {self.map_frame} frame)'
-        # )
-
-    def _odom_cb(self, msg: Odometry):
-        # LUCI publishes forward velocity on linear.y (body-frame convention,
-        # matches pid_velocity.py).
-        self.odom_lin = msg.twist.twist.linear.y
-        self.odom_ang = msg.twist.twist.angular.z
-        self.odom_received = True
 
     def _update_pose_from_tf(self) -> bool:
         """Refresh actual_x/y/yaw from current map -> robot_frame TF.
@@ -208,11 +172,7 @@ class LuciPositionPID(Node):
         return CancelResponse.ACCEPT
 
     async def _execute_callback(self, goal_handle):
-        """
-        Snapshot current map-frame pose from TF, then dead-reckon to the goal
-        using /luci/odom velocities. This isolates the PID from RTAB-Map
-        relocalization jumps that happen mid-navigation.
-        """
+        """Drive to the goal using live map -> base_link TF for pose feedback."""
         pose = goal_handle.request.pose.pose
 
         goal_stamped = PoseStamped()
@@ -221,26 +181,21 @@ class LuciPositionPID(Node):
         goal_stamped.pose            = pose
         self.goal_pub.publish(goal_stamped)
 
-        # Snapshot the starting pose from TF (with a brief retry — TF buffer
-        # might be momentarily empty at startup).
-        snapshot_ok = False
+        # Verify TF is available before accepting (brief retry — buffer might
+        # be momentarily empty at startup).
+        tf_ok = False
         for _ in range(10):
             if self._update_pose_from_tf():
-                snapshot_ok = True
+                tf_ok = True
                 break
             await asyncio.sleep(0.1)
-        if not snapshot_ok:
+        if not tf_ok:
             self.get_logger().error(
-                'Cannot snapshot starting pose — TF unavailable. Aborting goal.'
+                f'TF {self.map_frame}<-{self.robot_frame} unavailable. '
+                f'Aborting goal.'
             )
             goal_handle.abort()
             return NavigateToPose.Result()
-
-        self.get_logger().info(
-            f'Snapshot pose (map): x={self.actual_x:.2f} y={self.actual_y:.2f} '
-            f'yaw={math.degrees(self.actual_yaw):.1f}°  — dead-reckoning enabled'
-        )
-        self.dr_active = True
 
         q = pose.orientation
         skip_orientation = (q.x == 0.0 and q.y == 0.0
@@ -267,7 +222,6 @@ class LuciPositionPID(Node):
             if goal_handle.is_cancel_requested:
                 self.get_logger().info('Goal cancelled.')
                 self._stop_robot()
-                self.dr_active = False
                 goal_handle.canceled()
                 self._active_goal_handle = None
                 return NavigateToPose.Result()
@@ -275,14 +229,12 @@ class LuciPositionPID(Node):
 
             if self._active_goal_handle is not goal_handle:
                 self.get_logger().info('Goal preempted.')
-                self.dr_active = False
                 goal_handle.abort()
                 return NavigateToPose.Result()
 
 
             if self.orientation_reached:
                 self.get_logger().info('Goal succeeded.')
-                self.dr_active = False
                 goal_handle.succeed()
                 self._active_goal_handle = None
                 return NavigateToPose.Result()
@@ -294,7 +246,6 @@ class LuciPositionPID(Node):
 
             rate.sleep()
 
-        self.dr_active = False
         goal_handle.abort()
         self._active_goal_handle = None
         return NavigateToPose.Result()
@@ -303,18 +254,12 @@ class LuciPositionPID(Node):
         if self._active_goal_handle is None or self.orientation_reached:
             return
 
-        if not (self.dr_active and self.odom_received):
+        if not self._update_pose_from_tf():
             return
 
         now = self.get_clock().now()
         dt  = (now - self.last_time).nanoseconds * 1e-9
         self.last_time = now
-
-        # Dead-reckon from the snapshotted starting pose. Forward Euler is
-        # fine at 20 Hz for wheelchair speeds.
-        self.actual_x   += self.odom_lin * math.cos(self.actual_yaw) * dt
-        self.actual_y   += self.odom_lin * math.sin(self.actual_yaw) * dt
-        self.actual_yaw  = angle_wrap(self.actual_yaw + self.odom_ang * dt)
 
         if not self.goal_reached:
             dx            = self.goal_x - self.actual_x
